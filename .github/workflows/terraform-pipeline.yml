@@ -1,0 +1,78 @@
+on:
+  workflow_call:
+    secrets:
+      VAULT_TOKEN:
+        required: true
+env:
+  VAULT_ADDR: https://vault.camfu.co
+  k8s_version: v1.26.2
+jobs:
+  deploy:
+    runs-on: self-hosted
+    container:
+      image: hashicorp/terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v2
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            internal/data/s3 access_key | S3_ACCESS_KEY ;
+            internal/data/s3 secret_key | S3_SECRET_KEY ;
+            internal/data/generic s3_root_ca | S3_ROOT_CA ;
+            internal/data/generic ssh_private_key | SSH_KEY ;
+            internal/data/generic vault_token | VAULT_TOKEN ;
+            internal/data/generic kubeconfig | KUBE_CONFIG ;
+
+      - name: Set ssh key
+        run: |
+          mkdir -p /root/.ssh
+          echo -e "Host github.com\n  Preferredauthentications publickey\n  Port 22\n  StrictHostKeyChecking no" > /root/.ssh/config
+          ssh-keyscan -H github.com >> /root/.ssh/known_hosts
+          echo -e $SSH_KEY > /root/.ssh/id_rsa
+          chmod 600 /root/.ssh/id_rsa
+
+      - name: Set Kubectl
+        run: |
+          mkdir /root/.kube/
+          echo $KUBE_CONFIG | base64 -d > config
+          mv config /root/.kube/
+          wget -q "https://dl.k8s.io/release/${{ env.k8s_version }}/bin/linux/amd64/kubectl"
+          install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          terraform --version
+
+
+      - name: Terraform init
+        run: >-
+          cd terraform &&
+          terraform init
+          -backend=true
+          -backend-config="bucket=terraform"
+          -backend-config="key=${{ github.repository }}.tfstate"
+          -backend-config="region=us-east-1"
+          -backend-config="endpoint=minio.camfu.co"
+          -backend-config="access_key=${S3_ACCESS_KEY}"
+          -backend-config="secret_key=${S3_SECRET_KEY}"
+          -backend-config="skip_credentials_validation=true"
+          -backend-config="skip_region_validation=true"
+          -backend-config="force_path_style=true"
+
+      - name: Terraform validate
+        run: |
+          cd terraform
+          terraform validate
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          cd terraform
+          terraform plan -out=tfplan
+
+      - name: Terraform apply
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cd terraform
+          terraform apply tfplan

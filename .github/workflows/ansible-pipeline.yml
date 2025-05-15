@@ -1,0 +1,118 @@
+on:
+  workflow_call:
+    inputs:
+      ansible_verbosity:
+        default: -vv
+        type: string
+        required: false
+    secrets:
+      VAULT_TOKEN:
+        required: true
+env:
+  VAULT_ADDR: https://vault.camfu.co
+
+jobs:
+  changed-files:
+    runs-on: ubuntu-latest
+    outputs:
+      changed-files: ${{ steps.changed-files.outputs.all_changed_files }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@main
+        with:
+          dir_names: true
+          dir_names_exclude_current_dir: true
+          dir_names_max_depth: 1
+          path: ansible/roles
+          separator: ","
+
+      - name: List all changed files
+        env:
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        run: |
+          for file in ${ALL_CHANGED_FILES}; do
+            echo "$file was changed"
+          done
+
+  deploy:
+    runs-on: self-hosted
+    needs: changed-files
+    container:
+      image: ghcr.io/camfu-co/packer-ansible
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v3
+        id: vault
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            app/data/generic password | PASSWORD ;
+            app/data/generic ssh_private_key_file | SSH_KEY ;
+            app/data/generic vault_token | VAULT_TOKEN ;
+            app/data/discord_bots github_webhook | github_webhook
+
+      - name: Install dependencies
+        run: |
+          echo "$SSH_KEY" > /root/.ssh/id_rsa
+          chmod 600 /root/.ssh/id_rsa
+          ssh-keyscan -H 'github.com' >> /root/.ssh/known_hosts
+          echo $PASSWORD > /etc/ansible/vault
+
+      - name: Install ansible requirements
+        run: |
+          if [ -f "ansible/requirements.yml" ]; then
+            cd ansible
+            ansible-galaxy install -r requirements.yml
+          fi
+
+      - name: Check roles
+        id: roles
+        run: |
+          if [ -d ansible/roles ]; then
+            echo "roles=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy ansible playbook with roles
+        if: ${{ steps.roles.outputs.roles }}
+        run: cd ansible && ansible-playbook -i /etc/ansible/inv.proxmox.yml --tags ${{ needs.changed-files.outputs.changed-files }} playbook.yaml --vault-password-file /etc/ansible/vault ${{ inputs.ansible_verbosity }}
+
+      - name: Deploy ansible playbook without roles
+        if: ${{ ! steps.roles.outputs.roles }}
+        run: cd ansible && ansible-playbook -i /etc/ansible/inv.proxmox.yml playbook.yaml --vault-password-file /etc/ansible/vault ${{ inputs.ansible_verbosity }}
+
+      - name: Test Success
+        uses: rjstone/discord-webhook-notify@v1
+        if: success()
+        with:
+          severity: info
+          text: Ansible Run Success
+          description: |
+            - **Repo:** ${{ github.repository }}
+            - **Commit URL:** ${{ github.event.head_commit.url }}
+            - **Commit Message:** ${{ github.event.head_commit.message }}
+          webhookUrl: ${{ steps.vault.outputs.github_webhook }}
+
+      - name: Test Failure
+        uses: rjstone/discord-webhook-notify@v1
+        if: failure()
+        with:
+          severity: error
+          text: Ansible Run Failed
+          description: |
+            - **Repo:** ${{ github.repository }}
+            - **Commit URL:** ${{ github.event.head_commit.url }}
+            - **Commit Message:** ${{ github.event.head_commit.message }}
+          webhookUrl: ${{ steps.vault.outputs.github_webhook }}
